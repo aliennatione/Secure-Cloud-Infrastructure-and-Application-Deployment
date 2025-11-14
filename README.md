@@ -1,4 +1,3 @@
-```markdown
 # Secure Cloud Infrastructure & Application Deployment
 
 Questo progetto open-source fornisce una soluzione completa per il provisioning, l'hardening e il deployment di infrastrutture cloud sicure e applicazioni. Adotta un approccio "Infrastructure as Code" (IaC) per gestire le risorse cloud (Hetzner), Ansible per la configurazione del sistema operativo, HashiCorp Vault per la gestione centralizzata dei segreti (inclusa la passphrase LUKS), e InSpec per la verifica della conformità di sicurezza. L'intera pipeline è automatizzata tramite GitHub Actions, garantendo un ciclo di vita del deployment sicuro, deterministico e robusto, con particolare attenzione alla crittografia LUKS e allo sblocco remoto delle VPS Ubuntu.
@@ -181,4 +180,3 @@ Accogliamo con favore i contributi a questo progetto! Se hai suggerimenti, segna
 ## Licenza
 
 Questo progetto è rilasciato sotto la licenza MIT.
-```
