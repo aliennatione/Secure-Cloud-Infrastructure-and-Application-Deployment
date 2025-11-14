@@ -1,0 +1,165 @@
+name: Production Deployment Pipeline
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  TERRAFORM_VERSION: "1.8.5"
+  ANSIBLE_VERSION: "2.16.0"
+  VAULT_VERSION: "1.16.0"
+  HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+  VAULT_ADDR: ${{ secrets.VAULT_ADDR }}
+  VAULT_ROLE_ID: ${{ secrets.VAULT_ROLE_ID }}
+  VAULT_SECRET_ID: ${{ secrets.VAULT_SECRET_ID }}
+
+jobs:
+  terraform-plan:
+    runs-on: ubuntu-latest
+    outputs:
+      server_ip: ${{ steps.terraform-output.outputs.server_ip }}
+      server_id: ${{ steps.terraform-output.outputs.server_id }}
+      luks_passphrase_path: ${{ steps.terraform-output.outputs.luks_passphrase_path }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          
+      - name: Terraform init
+        working-directory: terraform/environments/prod
+        run: terraform init
+        
+      - name: Terraform plan
+        working-directory: terraform/environments/prod
+        id: plan
+        run: terraform plan -out=tfplan
+        
+      - name: Terraform apply
+        working-directory: terraform/environments/prod
+        run: terraform apply -auto-approve tfplan
+        
+      - name: Extract Terraform outputs
+        id: terraform-output
+        working-directory: terraform/environments/prod
+        run: |
+          echo "server_ip=$(terraform output -raw server_ip)" >> $GITHUB_OUTPUT
+          echo "server_id=$(terraform output -raw server_id)" >> $GITHUB_OUTPUT
+          echo "luks_passphrase_path=$(terraform output -raw luks_passphrase_path)" >> $GITHUB_OUTPUT
+          echo "vault_token=$(terraform output -raw vault_token)" >> $GITHUB_OUTPUT
+        env:
+          TF_LOG: INFO
+
+  ansible-hardening:
+    needs: terraform-plan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          
+      - name: Install Ansible and dependencies
+        run: |
+          pip install ansible==${{ env.ANSIBLE_VERSION }} hvac requests cryptography
+          
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.ADMIN_SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -t rsa ${{ needs.terraform-plan.outputs.server_ip }} >> ~/.ssh/known_hosts
+          
+      - name: Run hardening playbook
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+          VAULT_TOKEN: ${{ needs.terraform-plan.outputs.vault_token }}
+          LUKS_PASSPHRASE_PATH: ${{ needs.terraform-plan.outputs.luks_passphrase_path }}
+        run: |
+          ansible-playbook -i "${{ needs.terraform-plan.outputs.server_ip }}," \
+            -u root \
+            --private-key ~/.ssh/id_rsa \
+            ansible/playbooks/hardening.yml \
+            --extra-vars "target_server_id=${{ needs.terraform-plan.outputs.server_id }} \
+            luks_passphrase_path=${{ needs.terraform-plan.outputs.luks_passphrase_path }} \
+            vault_token=${{ needs.terraform-plan.outputs.vault_token }}"
+            
+      - name: Test Dropbear connection
+        run: |
+          sleep 30
+          ssh -o StrictHostKeyChecking=no -p 2222 root@${{ needs.terraform-plan.outputs.server_ip }} "echo 'Dropbear working'"
+
+  inspec-audit:
+    needs: ansible-hardening
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.2"
+          
+      - name: Install InSpec
+        run: gem install inspec -v 5.22.0
+        
+      - name: Run security compliance checks
+        env:
+          SERVER_IP: ${{ needs.terraform-plan.outputs.server_ip }}
+        run: |
+          inspec exec security_policy/inspec \
+            --target ssh://root@${SERVER_IP} \
+            --sudo \
+            --key-files ~/.ssh/id_rsa \
+            --controls=luks-01,luks-02,ssh-01,kernel-01 \
+            --reporter cli json:security_report.json
+        continue-on-error: false
+
+  deploy-application:
+    needs: inspec-audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          
+      - name: Deploy application
+        env:
+          SERVER_IP: ${{ needs.terraform-plan.outputs.server_ip }}
+          VAULT_TOKEN: ${{ needs.terraform-plan.outputs.vault_token }}
+        run: |
+          scp -o StrictHostKeyChecking=no -r application/src root@${SERVER_IP}:/mnt/secure/app
+          ssh -o StrictHostKeyChecking=no root@${SERVER_IP} "
+            cd /mnt/secure/app
+            python3 -m venv venv
+            source venv/bin/activate
+            pip install -r requirements.txt
+            python main.py
+          "
+          
+      - name: Verify application health
+        run: |
+          sleep 10
+          curl -f http://${{ needs.terraform-plan.outputs.server_ip }}:8000/health || exit 1
+
+  cleanup:
+    needs: deploy-application
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Cleanup sensitive data
+        run: |
+          rm -rf ~/.ssh
+          unset VAULT_TOKEN

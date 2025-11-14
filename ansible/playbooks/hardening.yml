@@ -1,0 +1,36 @@
+---
+- name: Harden and secure Ubuntu server
+  hosts: all
+  become: yes
+  gather_facts: yes
+  
+  vars_files:
+    - "../group_vars/all/vault_secrets.yml"
+  
+  vars:
+    luks_device: "/dev/sdb"
+    luks_mount_point: "/mnt/secure"
+    luks_volume_name: "cryptroot"
+  
+  roles:
+    - role: hardening
+      vars:
+        luks_enabled: true
+        dropbear_enabled: true
+        vault_agent_enabled: true
+  
+  tasks:
+    - name: Verify LUKS setup
+      shell: |
+        cryptsetup status {{ luks_volume_name }}
+      register: luks_status
+      failed_when: luks_status.rc != 0
+      changed_when: false
+    
+    - name: Set fact for Vault agent configuration
+      set_fact:
+        vault_agent_config:
+          server_addr: "{{ vault_addr }}"
+          auth_method: "token"
+          token: "{{ vault_token }}"
+          secrets_path: "{{ luks_passphrase_path }}"

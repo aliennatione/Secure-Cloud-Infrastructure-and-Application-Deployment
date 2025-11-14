@@ -1,0 +1,95 @@
+---
+- name: Install Dropbear for remote LUKS unlock
+  apt:
+    name:
+      - dropbear-initramfs
+      - busybox
+    state: present
+
+- name: Create Dropbear initramfs directory
+  file:
+    path: /etc/dropbear-initramfs
+    state: directory
+    mode: '0700'
+
+- name: Configure Dropbear authorized keys
+  template:
+    src: dropbear_authorized_keys.j2
+    dest: /etc/dropbear-initramfs/authorized_keys
+    mode: '0600'
+  vars:
+    dropbear_authorized_keys: "{{ vault_dropbear_authorized_keys }}"
+
+- name: Configure initramfs network
+  copy:
+    content: |
+      IP={{ ansible_default_ipv4.address }}::{{ ansible_default_ipv4.gateway }}:{{ ansible_default_ipv4.netmask }}:{{ ansible_hostname }}:eth0:off
+    dest: /etc/initramfs-tools/initramfs.conf
+    mode: '0644'
+  notify: update initramfs
+
+- name: Add network modules to initramfs
+  copy:
+    content: |
+      ip
+      af_packet
+    dest: /etc/initramfs-tools/modules
+    mode: '0644'
+  notify: update initramfs
+
+- name: Configure unlock script
+  copy:
+    content: |
+      #!/bin/sh
+      PREREQ="dropbear"
+      
+      prereqs() {
+        echo "$PREREQ"
+      }
+      
+      case $1 in
+        prereqs)
+          prereqs
+          exit 0
+          ;;
+      esac
+      
+      . /scripts/functions
+      
+      unlock_luks() {
+        local crypttarget=$1
+        local cryptsource=$2
+        local header=$3
+        
+        if [ -z "$header" ]; then
+          header=$cryptsource
+        fi
+        
+        mkdir -p /run/cryptsetup
+        modprobe -q dm-crypt || true
+        
+        /sbin/cryptsetup luksOpen "$cryptsource" "$crypttarget"
+      }
+      
+      # Wait for network
+      sleep 5
+      
+      # Start dropbear
+      /usr/sbin/dropbear -F -p 2222 -s -g -w &
+      
+      # Wait for unlock command
+      while true; do
+        if [ -f /run/unlock.command ]; then
+          . /run/unlock.command
+          unlock_luks "$CRYPTTARGET" "$CRYTPSOURCE"
+          break
+        fi
+        sleep 1
+      done
+      
+      # Kill dropbear
+      killall dropbear
+      exit 0
+    dest: /etc/initramfs-tools/hooks/unlock_script
+    mode: '0755'
+  notify: update initramfs

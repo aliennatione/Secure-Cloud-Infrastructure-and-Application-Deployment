@@ -1,0 +1,60 @@
+---
+- name: Install LUKS utilities
+  apt:
+    name:
+      - cryptsetup
+      - cryptsetup-initramfs
+    state: present
+    update_cache: yes
+
+- name: Wipe filesystem signatures from LUKS device
+  shell: |
+    wipefs --all {{ luks_device }}
+  args:
+    warn: false
+
+- name: Format device with LUKS
+  shell: |
+    echo -n "{{ luks_passphrase }}" | cryptsetup luksFormat {{ luks_device }} -
+  args:
+    stdin: "{{ luks_passphrase }}"
+    warn: false
+  no_log: true
+
+- name: Open LUKS device
+  shell: |
+    echo -n "{{ luks_passphrase }}" | cryptsetup open {{ luks_device }} {{ luks_volume_name }} --
+  args:
+    stdin: "{{ luks_passphrase }}"
+    warn: false
+  no_log: true
+
+- name: Create filesystem on LUKS volume
+  filesystem:
+    fstype: ext4
+    dev: "/dev/mapper/{{ luks_volume_name }}"
+
+- name: Create mount directory
+  file:
+    path: "{{ luks_mount_point }}"
+    state: directory
+    mode: '0755'
+
+- name: Mount LUKS volume
+  mount:
+    path: "{{ luks_mount_point }}"
+    src: "/dev/mapper/{{ luks_volume_name }}"
+    fstype: ext4
+    state: mounted
+
+- name: Get UUID of LUKS device
+  shell: blkid -s UUID -o value {{ luks_device }}
+  register: luks_uuid
+  changed_when: false
+
+- name: Configure crypttab
+  template:
+    src: crypttab.j2
+    dest: /etc/crypttab
+    mode: '0600'
+  notify: update initramfs
