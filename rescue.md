@@ -366,17 +366,16 @@ ssh root@<IP_VPS>
 ```bash
 #!/bin/bash
 # =========================================
-# 🔹 Setup VPS Sicura Avanzata (Debian 13)
-# Full-disk LUKS + Dropbear + LVM + Ansible + Containers
+# 🔹 Setup VPS Sicura Debian 13 (LUKS + LVM + Dropbear)
 # Da eseguire in Rescue Mode Hetzner
 # =========================================
 
 set -euo pipefail
 
 echo "==== 🔹 Step 0: Disattiva LVM e smonta eventuali mountpoint ===="
-# Disattiva tutti i volumi LVM attivi
-vgchange -an 2>/dev/null || true
+# Disattiva eventuali volumi LVM attivi
 lvchange -an 2>/dev/null || true
+vgchange -an 2>/dev/null || true
 
 # Smonta eventuali mountpoint
 for mp in /mnt /mnt/*; do
@@ -386,74 +385,62 @@ for mp in /mnt /mnt/*; do
     fi
 done
 
+# Chiudi eventuali volumi LUKS aperti
+for luks in $(ls /dev/mapper 2>/dev/null | grep -v control || true); do
+    cryptsetup luksClose "$luks" || true
+done
+
 echo "==== 🔹 Step 1: Identificazione disco principale ===="
 DISK=$(lsblk -nd -o NAME,TYPE | awk '$2=="disk"{print $1; exit}')
 if [ -z "$DISK" ]; then
     echo "Errore: nessun disco rilevato!"
     exit 1
 fi
-DISK_DEV="/dev/$DISK"
-echo "Disco rilevato: $DISK_DEV"
-
-# Controlla se ci sono volumi LVM attivi sul disco
-LVM_VOLUMES=$(pvs --noheadings -o pv_name | grep "$DISK_DEV" || true)
-if [ -n "$LVM_VOLUMES" ]; then
-    echo "Attenzione: sono stati rilevati volumi LVM su questo disco"
-    read -rp "Vuoi disattivare e cancellare LVM? [y/N]: " CONF_LVM
-    if [[ "$CONF_LVM" =~ ^[Yy]$ ]]; then
-        lvremove -f $(lvs --noheadings -o lv_path) || true
-        vgremove -f $(vgs --noheadings -o vg_name) || true
-        pvremove -f "$DISK_DEV"
-    else
-        echo "Operazione annullata per LVM. Esci e gestisci manualmente."
-        exit 1
-    fi
-fi
+DISK="/dev/$DISK"
+echo "Disco rilevato: $DISK"
 
 echo "==== 🔹 Step 2: Conferma cancellazione dati ===="
-echo "ATTENZIONE: la cifratura cancellerà TUTTI i dati su $DISK_DEV!"
+echo "ATTENZIONE: la cifratura cancellerà TUTTI i dati su $DISK!"
 read -rp "Digita YES per confermare: " CONFIRM
 if [[ "$CONFIRM" != "YES" ]]; then
     echo "Operazione annullata."
     exit 0
 fi
 
-echo "==== 🔹 Step 3: Cifratura full-disk LUKS ===="
-# Chiedi passphrase LUKS
-read -rsp "Inserisci passphrase LUKS: " LUKS_PASS
-echo
-read -rsp "Verifica passphrase: " LUKS_PASS2
-echo
-if [[ "$LUKS_PASS" != "$LUKS_PASS2" ]]; then
-    echo "Errore: le passphrase non corrispondono!"
-    exit 1
-fi
+echo "==== 🔹 Step 3: Pulisce vecchi header LUKS/GPT ===="
+echo "Sovrascrivo i primi 100MB del disco..."
+dd if=/dev/zero of="$DISK" bs=1M count=100 status=progress
 
-echo "$LUKS_PASS" | cryptsetup luksFormat "$DISK_DEV" -
-echo "$LUKS_PASS" | cryptsetup open "$DISK_DEV" cryptroot -
+echo "==== 🔹 Step 4: Cifratura full-disk LUKS ===="
+cryptsetup luksFormat "$DISK"
+cryptsetup open "$DISK" cryptroot
+
+echo "==== 🔹 Step 5: Setup filesystem e mount ===="
 mkfs.ext4 /dev/mapper/cryptroot
 mount /dev/mapper/cryptroot /mnt
 echo "Disco cifrato e montato su /mnt"
 
-echo "==== 🔹 Step 4: Clonazione repo e copia file ===="
+echo "==== 🔹 Step 6: Clonazione repo e copia file ===="
 git clone https://github.com/aliennatione/Secure-Cloud-Infrastructure-and-Application-Deployment.git /tmp/repo
 rsync -aHAX /tmp/repo/* /mnt/
 echo "Files della repo copiati"
 
-echo "==== 🔹 Step 5: Setup Dropbear per initramfs ===="
-apt update && apt install -y dropbear-initramfs
+echo "==== 🔹 Step 7: Setup Dropbear per initramfs ===="
+apt update
+apt install -y dropbear-initramfs
 
+# Configura chiave pubblica SSH (sostituisci con la tua!)
+SSH_KEY="ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQD..."  
 mkdir -p /etc/dropbear-initramfs
-read -rp "Inserisci la tua chiave pubblica SSH: " SSH_KEY
+echo "DROPBEAR_OPTIONS='-p 2222'" > /etc/dropbear-initramfs/config
+echo "DROPBEAR_EXTRA_ARGS='-s -g'" >> /etc/dropbear-initramfs/config
 echo "$SSH_KEY" > /etc/dropbear-initramfs/authorized_keys
-
-# Aggiorna initramfs con supporto LUKS
-echo "Attenzione: initramfs sarà aggiornato per supportare LUKS + Dropbear..."
+chmod 600 /etc/dropbear-initramfs/authorized_keys
 update-initramfs -u
 
-echo "Dropbear configurato per accesso remoto"
+echo "Dropbear configurato per accesso remoto nella initramfs"
 
-echo "==== 🔹 Step 6: Hardening OS con Ansible (opzionale) ===="
+echo "==== 🔹 Step 8: Hardening OS con Ansible (opzionale) ===="
 if [ -d /mnt/ansible ]; then
     docker run --rm -v /mnt/ansible:/ansible williamyeh/ansible:debian-alpine \
       ansible-playbook -i /ansible/inventory /ansible/playbook.yml
@@ -462,7 +449,7 @@ else
     echo "Cartella Ansible non trovata, salto hardening"
 fi
 
-echo "==== 🔹 Step 7: Deploy container applicazioni (opzionale) ===="
+echo "==== 🔹 Step 9: Deploy container applicazioni (opzionale) ===="
 if [ -f /mnt/docker-compose.yml ]; then
     docker compose -f /mnt/docker-compose.yml up -d
     echo "Container applicazioni avviati"
@@ -471,7 +458,8 @@ else
 fi
 
 echo "==== 🔹 Setup completato con successo ===="
-echo "Ora puoi riavviare la VPS con: reboot"
+echo "Puoi ora riavviare la VPS: reboot"
+
 
 
 ```
