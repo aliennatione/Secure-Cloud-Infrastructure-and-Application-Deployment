@@ -366,17 +366,17 @@ ssh root@<IP_VPS>
 ```bash
 #!/bin/bash
 # =========================================
-# 🔹 Setup VPS Sicura (LUKS + Dropbear + Ansible + Containers)
+# 🔹 Setup VPS Sicura Avanzata (Debian 13)
+# Full-disk LUKS + Dropbear + LVM + Ansible + Containers
 # Da eseguire in Rescue Mode Hetzner
 # =========================================
 
 set -euo pipefail
 
-echo "==== 🔹 Step 0: Verifica LVM attivi e mountpoint ===="
-# Disattiva eventuali volumi LVM attivi
-echo "Disattivando tutti i volumi LVM attivi..."
-lvchange -an 2>/dev/null || true
+echo "==== 🔹 Step 0: Disattiva LVM e smonta eventuali mountpoint ===="
+# Disattiva tutti i volumi LVM attivi
 vgchange -an 2>/dev/null || true
+lvchange -an 2>/dev/null || true
 
 # Smonta eventuali mountpoint
 for mp in /mnt /mnt/*; do
@@ -387,61 +387,73 @@ for mp in /mnt /mnt/*; do
 done
 
 echo "==== 🔹 Step 1: Identificazione disco principale ===="
-# Rileva automaticamente il primo disco disponibile
 DISK=$(lsblk -nd -o NAME,TYPE | awk '$2=="disk"{print $1; exit}')
 if [ -z "$DISK" ]; then
     echo "Errore: nessun disco rilevato!"
     exit 1
 fi
-echo "Disco rilevato: /dev/$DISK"
+DISK_DEV="/dev/$DISK"
+echo "Disco rilevato: $DISK_DEV"
 
-echo "==== 🔹 Step 2: Scelta modalità cifratura ===="
-read -rp "Vuoi cifrare l'intero disco (1) o solo una partizione libera (2)? [1/2]: " MODE
-
-if [[ "$MODE" == "1" ]]; then
-    TARGET="/dev/$DISK"
-elif [[ "$MODE" == "2" ]]; then
-    echo "Elenco partizioni disponibili:"
-    lsblk /dev/$DISK
-    read -rp "Inserisci la partizione da cifrare (es: /dev/sda3): " PART
-    if [[ ! -b "$PART" ]]; then
-        echo "Errore: la partizione non esiste!"
+# Controlla se ci sono volumi LVM attivi sul disco
+LVM_VOLUMES=$(pvs --noheadings -o pv_name | grep "$DISK_DEV" || true)
+if [ -n "$LVM_VOLUMES" ]; then
+    echo "Attenzione: sono stati rilevati volumi LVM su questo disco"
+    read -rp "Vuoi disattivare e cancellare LVM? [y/N]: " CONF_LVM
+    if [[ "$CONF_LVM" =~ ^[Yy]$ ]]; then
+        lvremove -f $(lvs --noheadings -o lv_path) || true
+        vgremove -f $(vgs --noheadings -o vg_name) || true
+        pvremove -f "$DISK_DEV"
+    else
+        echo "Operazione annullata per LVM. Esci e gestisci manualmente."
         exit 1
     fi
-    TARGET="$PART"
-else
-    echo "Scelta non valida!"
-    exit 1
 fi
 
-echo "==== 🔹 Step 3: Conferma cancellazione dati ===="
-echo "ATTENZIONE: la cifratura cancellerà TUTTI i dati su $TARGET!"
+echo "==== 🔹 Step 2: Conferma cancellazione dati ===="
+echo "ATTENZIONE: la cifratura cancellerà TUTTI i dati su $DISK_DEV!"
 read -rp "Digita YES per confermare: " CONFIRM
 if [[ "$CONFIRM" != "YES" ]]; then
     echo "Operazione annullata."
     exit 0
 fi
 
-echo "==== 🔹 Step 4: Cifratura LUKS ===="
-cryptsetup luksFormat "$TARGET"
-cryptsetup open "$TARGET" cryptroot
+echo "==== 🔹 Step 3: Cifratura full-disk LUKS ===="
+# Chiedi passphrase LUKS
+read -rsp "Inserisci passphrase LUKS: " LUKS_PASS
+echo
+read -rsp "Verifica passphrase: " LUKS_PASS2
+echo
+if [[ "$LUKS_PASS" != "$LUKS_PASS2" ]]; then
+    echo "Errore: le passphrase non corrispondono!"
+    exit 1
+fi
+
+echo "$LUKS_PASS" | cryptsetup luksFormat "$DISK_DEV" -
+echo "$LUKS_PASS" | cryptsetup open "$DISK_DEV" cryptroot -
 mkfs.ext4 /dev/mapper/cryptroot
 mount /dev/mapper/cryptroot /mnt
-echo "Disco/partizione cifrata e montata su /mnt"
+echo "Disco cifrato e montato su /mnt"
 
-echo "==== 🔹 Step 5: Clonazione repo e copia file ===="
+echo "==== 🔹 Step 4: Clonazione repo e copia file ===="
 git clone https://github.com/aliennatione/Secure-Cloud-Infrastructure-and-Application-Deployment.git /tmp/repo
 rsync -aHAX /tmp/repo/* /mnt/
 echo "Files della repo copiati"
 
-echo "==== 🔹 Step 6: Setup Dropbear per initramfs ===="
+echo "==== 🔹 Step 5: Setup Dropbear per initramfs ===="
 apt update && apt install -y dropbear-initramfs
-# Inserisci qui la tua chiave pubblica SSH
-echo "SSH_KEY='ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQD...'" >> /etc/dropbear-initramfs/config
+
+mkdir -p /etc/dropbear-initramfs
+read -rp "Inserisci la tua chiave pubblica SSH: " SSH_KEY
+echo "$SSH_KEY" > /etc/dropbear-initramfs/authorized_keys
+
+# Aggiorna initramfs con supporto LUKS
+echo "Attenzione: initramfs sarà aggiornato per supportare LUKS + Dropbear..."
 update-initramfs -u
+
 echo "Dropbear configurato per accesso remoto"
 
-echo "==== 🔹 Step 7: Hardening OS con Ansible ===="
+echo "==== 🔹 Step 6: Hardening OS con Ansible (opzionale) ===="
 if [ -d /mnt/ansible ]; then
     docker run --rm -v /mnt/ansible:/ansible williamyeh/ansible:debian-alpine \
       ansible-playbook -i /ansible/inventory /ansible/playbook.yml
@@ -450,7 +462,7 @@ else
     echo "Cartella Ansible non trovata, salto hardening"
 fi
 
-echo "==== 🔹 Step 8: Deploy container applicazioni (opzionale) ===="
+echo "==== 🔹 Step 7: Deploy container applicazioni (opzionale) ===="
 if [ -f /mnt/docker-compose.yml ]; then
     docker compose -f /mnt/docker-compose.yml up -d
     echo "Container applicazioni avviati"
@@ -459,6 +471,8 @@ else
 fi
 
 echo "==== 🔹 Setup completato con successo ===="
+echo "Ora puoi riavviare la VPS con: reboot"
+
 
 ```
 
