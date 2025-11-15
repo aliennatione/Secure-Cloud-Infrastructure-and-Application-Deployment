@@ -372,6 +372,20 @@ ssh root@<IP_VPS>
 
 set -euo pipefail
 
+echo "==== 🔹 Step 0: Verifica LVM attivi e mountpoint ===="
+# Disattiva eventuali volumi LVM attivi
+echo "Disattivando tutti i volumi LVM attivi..."
+lvchange -an 2>/dev/null || true
+vgchange -an 2>/dev/null || true
+
+# Smonta eventuali mountpoint
+for mp in /mnt /mnt/*; do
+    if mountpoint -q "$mp"; then
+        echo "Smonto $mp..."
+        umount -lf "$mp"
+    fi
+done
+
 echo "==== 🔹 Step 1: Identificazione disco principale ===="
 # Rileva automaticamente il primo disco disponibile
 DISK=$(lsblk -nd -o NAME,TYPE | awk '$2=="disk"{print $1; exit}')
@@ -381,32 +395,62 @@ if [ -z "$DISK" ]; then
 fi
 echo "Disco rilevato: /dev/$DISK"
 
-echo "==== 🔹 Step 2: Cifratura LUKS ===="
-cryptsetup luksFormat /dev/$DISK
-cryptsetup open /dev/$DISK cryptroot
+echo "==== 🔹 Step 2: Scelta modalità cifratura ===="
+read -rp "Vuoi cifrare l'intero disco (1) o solo una partizione libera (2)? [1/2]: " MODE
+
+if [[ "$MODE" == "1" ]]; then
+    TARGET="/dev/$DISK"
+elif [[ "$MODE" == "2" ]]; then
+    echo "Elenco partizioni disponibili:"
+    lsblk /dev/$DISK
+    read -rp "Inserisci la partizione da cifrare (es: /dev/sda3): " PART
+    if [[ ! -b "$PART" ]]; then
+        echo "Errore: la partizione non esiste!"
+        exit 1
+    fi
+    TARGET="$PART"
+else
+    echo "Scelta non valida!"
+    exit 1
+fi
+
+echo "==== 🔹 Step 3: Conferma cancellazione dati ===="
+echo "ATTENZIONE: la cifratura cancellerà TUTTI i dati su $TARGET!"
+read -rp "Digita YES per confermare: " CONFIRM
+if [[ "$CONFIRM" != "YES" ]]; then
+    echo "Operazione annullata."
+    exit 0
+fi
+
+echo "==== 🔹 Step 4: Cifratura LUKS ===="
+cryptsetup luksFormat "$TARGET"
+cryptsetup open "$TARGET" cryptroot
 mkfs.ext4 /dev/mapper/cryptroot
 mount /dev/mapper/cryptroot /mnt
-echo "Disco cifrato e montato su /mnt"
+echo "Disco/partizione cifrata e montata su /mnt"
 
-echo "==== 🔹 Step 3: Clonazione repo e copia file ===="
+echo "==== 🔹 Step 5: Clonazione repo e copia file ===="
 git clone https://github.com/aliennatione/Secure-Cloud-Infrastructure-and-Application-Deployment.git /tmp/repo
 rsync -aHAX /tmp/repo/* /mnt/
 echo "Files della repo copiati"
 
-echo "==== 🔹 Step 4: Setup Dropbear per initramfs ===="
+echo "==== 🔹 Step 6: Setup Dropbear per initramfs ===="
 apt update && apt install -y dropbear-initramfs
 # Inserisci qui la tua chiave pubblica SSH
 echo "SSH_KEY='ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQD...'" >> /etc/dropbear-initramfs/config
 update-initramfs -u
 echo "Dropbear configurato per accesso remoto"
 
-echo "==== 🔹 Step 5: Hardening OS con Ansible ===="
-docker run --rm -v /mnt/ansible:/ansible williamyeh/ansible:debian-alpine \
-  ansible-playbook -i /ansible/inventory /ansible/playbook.yml
-echo "Hardening completato"
+echo "==== 🔹 Step 7: Hardening OS con Ansible ===="
+if [ -d /mnt/ansible ]; then
+    docker run --rm -v /mnt/ansible:/ansible williamyeh/ansible:debian-alpine \
+      ansible-playbook -i /ansible/inventory /ansible/playbook.yml
+    echo "Hardening completato"
+else
+    echo "Cartella Ansible non trovata, salto hardening"
+fi
 
-echo "==== 🔹 Step 6: Deploy container applicazioni (opzionale) ===="
-# Controlla se docker-compose.yml esiste nella repo
+echo "==== 🔹 Step 8: Deploy container applicazioni (opzionale) ===="
 if [ -f /mnt/docker-compose.yml ]; then
     docker compose -f /mnt/docker-compose.yml up -d
     echo "Container applicazioni avviati"
@@ -414,9 +458,8 @@ else
     echo "Nessun docker-compose.yml trovato, salto deploy container"
 fi
 
-echo "==== 🔹 Step 7: Riavvio VPS ===="
-echo "Riavvio in corso..."
-reboot
+echo "==== 🔹 Setup completato con successo ===="
+
 ```
 
 ---
