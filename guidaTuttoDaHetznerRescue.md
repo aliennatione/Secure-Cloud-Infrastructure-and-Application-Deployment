@@ -98,8 +98,10 @@ cd Secure-Cloud-Infrastructure-and-Application-Deployment
 * Puoi eseguire Ansible **direttamente nella rescue mode**. Se vuoi usare container Ansible dentro la VPS (senza installare nulla sul sistema), puoi farlo così:
 
 ```bash
-docker run --rm -v $(pwd)/ansible:/ansible williamyeh/ansible:debian-alpine \
-  ansible-playbook -i /ansible/inventory /ansible/playbook.yml
+apt install -y podman
+podman run --rm -v $(pwd)/ansible:/ansible quay.io/ansible/ansible-runner:latest \
+    ansible-playbook -i /ansible/inventory /ansible/playbook.yml
+
 ```
 
 > Questa operazione applica tutto l’hardening OS, inclusi gli aspetti critici di sicurezza, senza mai toccare il PC locale.
