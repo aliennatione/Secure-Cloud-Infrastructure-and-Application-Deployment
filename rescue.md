@@ -461,38 +461,35 @@ Oppure (SSH_PUBLIC_KEY):
 
 set -euo pipefail
 
-# ====================
-# 🔹 Variabili da modificare
-# ====================
-DISK=""                  # Se vuoto, viene rilevato automaticamente
-SSH_KEY="ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQD..."  # Chiave SSH per Dropbear
-ANSIBLE_DIR="/mnt/ansible"   # Path ansible sul disco cifrato
-PODMAN_ROOT="/mnt/podman"    # Storage root per Podman
+# ==================== VARIABILI MODIFICABILI ====================
+DISK_DEFAULT="sda"                       # Disco principale da cifrare
+MOUNT_POINT="/mnt"                        # Punto di mount temporaneo
+SSH_PUBLIC_KEY="ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQD..." # tua chiave SSH
+REPO_URL="https://github.com/aliennatione/Secure-Cloud-Infrastructure-and-Application-Deployment.git"
+# ================================================================
 
-# ====================
-echo "==== 🔹 Step 0: Disattiva LVM e smonta eventuali mountpoint ===="
+DISK="${DISK:-$DISK_DEFAULT}"
+
+echo "==== 🔹 Step 0: Disattiva LVM, smonta e chiudi mapper ===="
 lvchange -an 2>/dev/null || true
 vgchange -an 2>/dev/null || true
 
-for mp in /mnt /mnt/*; do
-    if mountpoint -q "$mp"; then
-        echo "Smonto $mp..."
-        umount -lf "$mp" || true
-    fi
+umount -lf "$MOUNT_POINT" 2>/dev/null || true
+for mp in "$MOUNT_POINT"/*; do
+    umount -lf "$mp" 2>/dev/null || true
 done
 
-# ====================
+for m in $(ls /dev/mapper/ 2>/dev/null); do
+    cryptsetup luksClose "$m" 2>/dev/null || true
+done
+
 echo "==== 🔹 Step 1: Identificazione disco principale ===="
-if [ -z "$DISK" ]; then
-    DISK=$(lsblk -nd -o NAME,TYPE | awk '$2=="disk"{print $1; exit}')
-fi
-if [ -z "$DISK" ]; then
-    echo "Errore: nessun disco rilevato!"
+if [ ! -b "/dev/$DISK" ]; then
+    echo "Errore: disco /dev/$DISK non trovato!"
     exit 1
 fi
-echo "Disco rilevato: /dev/$DISK"
+echo "Disco selezionato: /dev/$DISK"
 
-# ====================
 echo "==== 🔹 Step 2: Conferma cancellazione dati ===="
 echo "ATTENZIONE: la cifratura cancellerà TUTTI i dati su /dev/$DISK!"
 read -rp "Digita YES per confermare: " CONFIRM
@@ -501,62 +498,52 @@ if [[ "$CONFIRM" != "YES" ]]; then
     exit 0
 fi
 
-# ====================
 echo "==== 🔹 Step 3: Pulisce vecchi header LUKS/GPT ===="
 dd if=/dev/zero of=/dev/$DISK bs=1M count=100 status=progress || true
+sync
 
-# ====================
 echo "==== 🔹 Step 4: Cifratura full-disk LUKS ===="
 cryptsetup luksFormat --type luks2 --pbkdf-memory=1048576 /dev/$DISK
 cryptsetup open /dev/$DISK cryptroot
 mkfs.ext4 /dev/mapper/cryptroot
-mount /dev/mapper/cryptroot /mnt
-echo "Disco cifrato e montato su /mnt"
+mount /dev/mapper/cryptroot "$MOUNT_POINT"
+echo "Disco cifrato e montato su $MOUNT_POINT"
 
-# ====================
 echo "==== 🔹 Step 5: Clonazione repo e copia file ===="
-git clone https://github.com/aliennatione/Secure-Cloud-Infrastructure-and-Application-Deployment.git /tmp/repo
-rsync -aHAX /tmp/repo/* /mnt/
+git clone "$REPO_URL" /tmp/repo
+rsync -aHAX /tmp/repo/* "$MOUNT_POINT/"
 echo "Files della repo copiati"
 
-# ====================
 echo "==== 🔹 Step 6: Setup Dropbear per initramfs ===="
 apt update
 apt install -y dropbear-initramfs
 mkdir -p /etc/dropbear-initramfs
-echo "SSH_KEY='$SSH_KEY'" >> /etc/dropbear-initramfs/config
+echo "SSH_KEY='$SSH_PUBLIC_KEY'" >> /etc/dropbear-initramfs/config
 update-initramfs -u
 echo "Dropbear configurato per accesso remoto nella initramfs"
 
-# ====================
 echo "==== 🔹 Step 7: Installa Podman ===="
-apt install -y podman
-mkdir -p "$PODMAN_ROOT"
-export STORAGE_ROOT="$PODMAN_ROOT"
-podman system reset -f || true
-echo "Podman installato con storage root su $PODMAN_ROOT"
+apt install -y podman podman-compose
+echo "Podman installato"
 
-# ====================
 echo "==== 🔹 Step 8: Hardening OS con Ansible (opzionale) ===="
-if [ -d /mnt/ansible ]; then
-    podman run --rm -v /mnt/ansible:/ansible quay.io/ansible/ansible-runner:latest \
+if [ -d "$MOUNT_POINT/ansible" ]; then
+    podman run --rm -v "$MOUNT_POINT/ansible":/ansible quay.io/ansible/ansible-runner:latest \
       ansible-playbook -i /ansible/inventory /ansible/playbook.yml || echo "Ansible fallito, continuo comunque"
     echo "Hardening completato"
 else
     echo "Cartella Ansible non trovata, salto hardening"
 fi
 
-# ====================
 echo "==== 🔹 Step 9: Deploy container applicazioni (opzionale) ===="
-if [ -f /mnt/docker-compose.yml ]; then
-    podman-compose -f /mnt/docker-compose.yml up -d || echo "Deploy container fallito"
+if [ -f "$MOUNT_POINT/docker-compose.yml" ]; then
+    podman-compose -f "$MOUNT_POINT/docker-compose.yml" up -d || echo "Deploy container fallito"
     echo "Container applicazioni avviati"
 else
     echo "Nessun docker-compose.yml trovato, salto deploy container"
 fi
 
 echo "==== 🔹 Setup completato con successo ===="
-
 
 ```
 ---
