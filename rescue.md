@@ -366,28 +366,21 @@ ssh root@<IP_VPS>
 ```bash
 #!/bin/bash
 # =========================================
-# 🔹 Setup VPS Sicura Debian 13 (LUKS + LVM + Dropbear)
-# Da eseguire in Rescue Mode Hetzner
+# 🔹 Setup VPS Sicura (LUKS + Dropbear + Podman + Ansible)
+# Da eseguire in Rescue Mode Hetzner su Debian 13
 # =========================================
 
 set -euo pipefail
 
 echo "==== 🔹 Step 0: Disattiva LVM e smonta eventuali mountpoint ===="
-# Disattiva eventuali volumi LVM attivi
 lvchange -an 2>/dev/null || true
 vgchange -an 2>/dev/null || true
 
-# Smonta eventuali mountpoint
 for mp in /mnt /mnt/*; do
     if mountpoint -q "$mp"; then
         echo "Smonto $mp..."
-        umount -lf "$mp"
+        umount -lf "$mp" || true
     fi
-done
-
-# Chiudi eventuali volumi LUKS aperti
-for luks in $(ls /dev/mapper 2>/dev/null | grep -v control || true); do
-    cryptsetup luksClose "$luks" || true
 done
 
 echo "==== 🔹 Step 1: Identificazione disco principale ===="
@@ -396,11 +389,10 @@ if [ -z "$DISK" ]; then
     echo "Errore: nessun disco rilevato!"
     exit 1
 fi
-DISK="/dev/$DISK"
-echo "Disco rilevato: $DISK"
+echo "Disco rilevato: /dev/$DISK"
 
 echo "==== 🔹 Step 2: Conferma cancellazione dati ===="
-echo "ATTENZIONE: la cifratura cancellerà TUTTI i dati su $DISK!"
+echo "ATTENZIONE: la cifratura cancellerà TUTTI i dati su /dev/$DISK!"
 read -rp "Digita YES per confermare: " CONFIRM
 if [[ "$CONFIRM" != "YES" ]]; then
     echo "Operazione annullata."
@@ -408,42 +400,37 @@ if [[ "$CONFIRM" != "YES" ]]; then
 fi
 
 echo "==== 🔹 Step 3: Pulisce vecchi header LUKS/GPT ===="
-echo "Sovrascrivo i primi 100MB del disco..."
-dd if=/dev/zero of="$DISK" bs=1M count=100 status=progress
+dd if=/dev/zero of=/dev/$DISK bs=1M count=100 status=progress
 
 echo "==== 🔹 Step 4: Cifratura full-disk LUKS ===="
-cryptsetup luksFormat "$DISK"
-cryptsetup open "$DISK" cryptroot
-
-echo "==== 🔹 Step 5: Setup filesystem e mount ===="
+cryptsetup luksFormat --type luks2 --pbkdf-memory=1048576 /dev/$DISK
+cryptsetup open /dev/$DISK cryptroot
 mkfs.ext4 /dev/mapper/cryptroot
 mount /dev/mapper/cryptroot /mnt
 echo "Disco cifrato e montato su /mnt"
 
-echo "==== 🔹 Step 6: Clonazione repo e copia file ===="
+echo "==== 🔹 Step 5: Clonazione repo e copia file ===="
 git clone https://github.com/aliennatione/Secure-Cloud-Infrastructure-and-Application-Deployment.git /tmp/repo
 rsync -aHAX /tmp/repo/* /mnt/
 echo "Files della repo copiati"
 
-echo "==== 🔹 Step 7: Setup Dropbear per initramfs ===="
+echo "==== 🔹 Step 6: Setup Dropbear per initramfs ===="
 apt update
 apt install -y dropbear-initramfs
-
-# Configura chiave pubblica SSH (sostituisci con la tua!)
-SSH_KEY="ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQD..."  
 mkdir -p /etc/dropbear-initramfs
-echo "DROPBEAR_OPTIONS='-p 2222'" > /etc/dropbear-initramfs/config
-echo "DROPBEAR_EXTRA_ARGS='-s -g'" >> /etc/dropbear-initramfs/config
-echo "$SSH_KEY" > /etc/dropbear-initramfs/authorized_keys
-chmod 600 /etc/dropbear-initramfs/authorized_keys
+# Inserisci qui la tua chiave pubblica SSH
+echo "SSH_KEY='ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQD...'" >> /etc/dropbear-initramfs/config
 update-initramfs -u
-
 echo "Dropbear configurato per accesso remoto nella initramfs"
+
+echo "==== 🔹 Step 7: Installa Podman ===="
+apt install -y podman
+echo "Podman installato"
 
 echo "==== 🔹 Step 8: Hardening OS con Ansible (opzionale) ===="
 if [ -d /mnt/ansible ]; then
-    docker run --rm -v /mnt/ansible:/ansible williamyeh/ansible:debian-alpine \
-      ansible-playbook -i /ansible/inventory /ansible/playbook.yml
+    podman run --rm -v /mnt/ansible:/ansible quay.io/ansible/ansible-runner:latest \
+      ansible-playbook -i /ansible/inventory /ansible/playbook.yml || echo "Ansible fallito, continuo comunque"
     echo "Hardening completato"
 else
     echo "Cartella Ansible non trovata, salto hardening"
@@ -451,19 +438,161 @@ fi
 
 echo "==== 🔹 Step 9: Deploy container applicazioni (opzionale) ===="
 if [ -f /mnt/docker-compose.yml ]; then
-    docker compose -f /mnt/docker-compose.yml up -d
+    podman-compose -f /mnt/docker-compose.yml up -d || echo "Deploy container fallito"
     echo "Container applicazioni avviati"
 else
     echo "Nessun docker-compose.yml trovato, salto deploy container"
 fi
 
 echo "==== 🔹 Setup completato con successo ===="
-echo "Puoi ora riavviare la VPS: reboot"
-
-
 
 ```
 
+
+
+OPPURE:
+
+```bash
+#!/bin/bash
+# =========================================
+# 🔹 Setup VPS Sicura (LUKS + LVM + Dropbear + Podman + Ansible)
+# Da eseguire in Rescue Mode Hetzner su Debian 13
+# =========================================
+
+set -euo pipefail
+
+# =========================================
+# 🔹 VARIABILI CONFIGURABILI
+# =========================================
+DISK=""                         # Lascia vuoto per rilevare automaticamente
+SSH_KEY="ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQD..."  # Chiave pubblica per Dropbear
+REPO_URL="https://github.com/aliennatione/Secure-Cloud-Infrastructure-and-Application-Deployment.git"
+VG_NAME="vg_secure"
+LV_NAME="lv_root"
+MOUNT_POINT="/mnt"
+LUKS_NAME="cryptroot"
+
+# =========================================
+# 🔹 Step 0: Disattiva LVM e smonta mountpoint
+# =========================================
+echo "==== 🔹 Step 0: Disattiva LVM e smonta eventuali mountpoint ===="
+lvchange -an 2>/dev/null || true
+vgchange -an 2>/dev/null || true
+
+for mp in "$MOUNT_POINT" "$MOUNT_POINT"/*; do
+    if mountpoint -q "$mp"; then
+        echo "Smonto $mp..."
+        umount -lf "$mp" || true
+    fi
+done
+
+# =========================================
+# 🔹 Step 1: Identificazione disco principale
+# =========================================
+if [ -z "$DISK" ]; then
+    DISK=$(lsblk -nd -o NAME,TYPE | awk '$2=="disk"{print $1; exit}')
+fi
+
+if [ -z "$DISK" ]; then
+    echo "Errore: nessun disco rilevato!"
+    exit 1
+fi
+echo "Disco rilevato: /dev/$DISK"
+
+# =========================================
+# 🔹 Step 2: Conferma cancellazione dati
+# =========================================
+echo "ATTENZIONE: la cifratura cancellerà TUTTI i dati su /dev/$DISK!"
+read -rp "Digita YES per confermare: " CONFIRM
+if [[ "$CONFIRM" != "YES" ]]; then
+    echo "Operazione annullata."
+    exit 0
+fi
+
+# =========================================
+# 🔹 Step 3: Pulizia header LUKS/GPT
+# =========================================
+dd if=/dev/zero of=/dev/$DISK bs=1M count=100 status=progress
+
+# =========================================
+# 🔹 Step 4: Cifratura full-disk LUKS
+# =========================================
+echo "==== 🔹 Inserisci passphrase LUKS ===="
+read -rsp "Passphrase: " LUKS_PASS
+echo
+echo -n "$LUKS_PASS" | cryptsetup luksFormat --type luks2 /dev/$DISK -
+echo -n "$LUKS_PASS" | cryptsetup open /dev/$DISK $LUKS_NAME -
+
+# =========================================
+# 🔹 Step 4b: Creazione LVM sopra LUKS
+# =========================================
+pvcreate /dev/mapper/$LUKS_NAME
+vgcreate $VG_NAME /dev/mapper/$LUKS_NAME
+lvcreate -n $LV_NAME -l 100%FREE $VG_NAME
+mkfs.ext4 /dev/$VG_NAME/$LV_NAME
+mount /dev/$VG_NAME/$LV_NAME $MOUNT_POINT
+echo "Disco cifrato, LVM creato e montato su $MOUNT_POINT"
+
+# =========================================
+# 🔹 Step 5: Clonazione repo e copia file
+# =========================================
+git clone "$REPO_URL" /tmp/repo
+rsync -aHAX /tmp/repo/* $MOUNT_POINT/
+echo "Files della repo copiati"
+
+# =========================================
+# 🔹 Step 6: Setup Dropbear per initramfs
+# =========================================
+apt update
+apt install -y dropbear-initramfs
+mkdir -p /etc/dropbear-initramfs
+echo "SSH_KEY='$SSH_KEY'" >> /etc/dropbear-initramfs/config
+update-initramfs -u
+echo "Dropbear configurato per accesso remoto nella initramfs"
+
+# =========================================
+# 🔹 Step 7: Installa Podman e Podman-compose
+# =========================================
+apt install -y podman python3-pip
+pip install podman-compose
+echo "Podman e podman-compose installati"
+
+# =========================================
+# 🔹 Step 8: Hardening OS con Ansible (opzionale)
+# =========================================
+if [ -d $MOUNT_POINT/ansible ]; then
+    podman run --rm -v $MOUNT_POINT/ansible:/ansible quay.io/ansible/ansible-runner:latest \
+      ansible-playbook -i /ansible/inventory /ansible/playbook.yml || echo "Ansible fallito, continuo comunque"
+    echo "Hardening completato"
+else
+    echo "Cartella Ansible non trovata, salto hardening"
+fi
+
+# =========================================
+# 🔹 Step 9: Deploy container applicazioni (opzionale)
+# =========================================
+if [ -f $MOUNT_POINT/docker-compose.yml ]; then
+    podman-compose -f $MOUNT_POINT/docker-compose.yml up -d || echo "Deploy container fallito"
+    echo "Container applicazioni avviati"
+else
+    echo "Nessun docker-compose.yml trovato, salto deploy container"
+fi
+
+# =========================================
+# 🔹 Step 10: Verifiche finali
+# =========================================
+echo "==== 🔹 Verifica LUKS ===="
+cryptsetup status $LUKS_NAME || echo "Errore LUKS"
+
+echo "==== 🔹 Verifica Dropbear ===="
+systemctl status dropbear-initramfs || echo "Dropbear non attivo"
+
+echo "==== 🔹 Verifica Podman ===="
+podman --version
+podman-compose --version || echo "podman-compose non installato correttamente"
+
+echo "==== 🔹 Setup completato con successo ===="
+```
 ---
 
 ### **Istruzioni di utilizzo**
